@@ -191,58 +191,75 @@ function M.raw_fzf(contents, fzf_cli_args, opts)
     end
   end)
 
-  -- I'm not sure why this happens (probably a neovim bug) but when pressing
-  -- <C-c> in quick successsion immediately after opening the window neovim
-  -- hangs the CPU at 100% at the last `coroutine.yield` before returning from
-  -- this function. At this point it seems that the fzf subprocess was started
-  -- and killed but `on_exit` is never called. In order to avoid calling `yield`
-  -- I tried checking the job/coroutine status in different ways:
-  --   * coroutine.status(co): always returns 'running'
-  --   * vim.fn.job_pid: always returns the corrent pid (even if it doesn't
-  --     exist anymore)
-  --   * vim.fn.jobwait({job_pid}, 0): always returns '-1' (even when looping
-  --     with 'vim.defer_fn(fn, 100)')
-  --   * uv.os_priority(job_pid): always returns '0'
-  -- `sudo strace -s 99 -ffp <pid> when neovim is stuck:
-  --   [pid 27433] <... epoll_wait resumed>[{events=EPOLLIN, data={u32=18, u64=18}}], 1024, -1) = 1
-  --   [pid 27432] <... write resumed>)        = 8
-  --   [pid 27433] read(18, "\1\0\0\0\0\0\0\0", 1024) = 8
-  --   [pid 27432] epoll_wait(9,  <unfinished ...>
-  --   [pid 27433] epoll_wait(15,  <unfinished ...>
-  --   [pid 27432] <... epoll_wait resumed>[], 1024, 0) = 0
-  --   [pid 27432] epoll_wait(9, [], 1024, 0)  = 0
-  --   [pid 27432] epoll_wait(9, [], 1024, 0)  = 0
-  --   [pid 27432] epoll_wait(9, [], 1024, 0)  = 0
-  --   [pid 27432] write(32, "\3", 1)          = 1
-  --   [pid 27432] write(18, "\1\0\0\0\0\0\0\0", 8 <unfinished ...>
-  --   [pid 27433] <... epoll_wait resumed>[{events=EPOLLIN, data={u32=18, u64=18}}], 1024, -1) = 1
-  --   [pid 27432] <... write resumed>)        = 8
-  --   [pid 27433] read(18, "\1\0\0\0\0\0\0\0", 1024) = 8
-  --   [pid 27432] epoll_wait(9,  <unfinished ...>
-  --   [pid 27433] epoll_wait(15,  <unfinished ...>
-  --   [pid 27432] <... epoll_wait resumed>[], 1024, 0) = 0
-  --   [pid 27432] epoll_wait(9, [], 1024, 0)  = 0
-  --   [pid 27432] epoll_wait(9, [], 1024, 0)  = 0
-  --   [pid 27432] epoll_wait(9, [], 1024, 0)  = 0
-  --   [pid 27432] write(32, "\3", 1)          = 1
-  --   [pid 27432] write(18, "\1\0\0\0\0\0\0\0", 8 <unfinished ...>
-  --
-  -- As a workaround we map buffer <C-c> to <Esc> for the fzf buffer
-  -- `vim.keymap.set` to avoid breaking compatibility with older neovim versions
-  --
-  -- Removed as an experiment since the removal of the `save_query` code
-  -- that was running on WinLeave which seems to make the `<C-c>` issue
-  -- better or even non-existent? RESTORED AGAIN
-  --
-  if vim.keymap then
-    vim.keymap.set("t", "<C-c>", "<Esc>", { buffer = 0 })
-  else
-    vim.api.nvim_buf_set_keymap(0, "t", "<C-c>", "<Esc>", { noremap = true })
-  end
-
   if opts.debug then
     print("[Fzf-lua]: FZF_DEFAULT_COMMAND:", FZF_DEFAULT_COMMAND)
     print("[Fzf-lua]: fzf cmd:", table.concat(cmd, " "))
+  end
+
+  local pid, chan_id, ns_id, sigint_recieved, fh_trace
+  if opts.debug_tracelog then
+    fh_trace = io.open(vim.fn.expand(opts.debug_tracelog), "wb")
+    if fh_trace then
+      debug.sethook(function(_, _)
+        local s = string.format("%s %s:%s %s\n",
+          os.date("%Y-%m-%dT%H:%M:%S"),
+          debug.getinfo(2, "S").source,
+          debug.getinfo(2, "l").currentline,
+          debug.getinfo(2, "n").name)
+        fh_trace:write(s)
+        fh_trace:flush()
+      end, "l")
+    end
+  end
+
+  if opts.nvim_freeze_workaround and vim.on_key then
+    opts.nvim_freeze_workaround = tonumber(opts.nvim_freeze_workaround) or 2
+    ns_id = vim.api.nvim_create_namespace("fzf-lua")
+    if tonumber(ns_id) then
+      vim.on_key(function(key)
+        -- ctrl-c is 0x3
+        if string.byte(key, 1) == 3 then
+          if not sigint_recieved then
+            sigint_recieved = 1
+            if opts.nvim_freeze_workaround >= 2 then
+              utils.info(string.format("ctrl-c recieved for job %d [pid:%d]...", chan_id, pid))
+            end
+          else
+            sigint_recieved = sigint_recieved + 1
+            if type(uv.os_getpriority(pid)) == "number" then
+              if opts.nvim_freeze_workaround >= 1 then
+                utils.warn(string.format(
+                  "%s: ctrl-c seen %d times, terminating job %d [pid:%d]...",
+                  os.date(), sigint_recieved, chan_id, pid))
+              end
+              vim.fn.jobstop(chan_id)
+              libuv.process_kill(pid)
+            else
+              if sigint_recieved > 3 then
+                -- process is not alive but we're still in the loop?
+                error(string.format("%s, ctr-c seen %d times, pid %d is already dead.",
+                  os.date(), sigint_recieved, pid))
+              end
+            end
+          end
+        end
+        return ns_id
+      end, ns_id)
+    end
+  end
+
+  local function unset_debughook()
+    if fh_trace then
+      debug.sethook(nil, "", 0)
+      fh_trace:close()
+    end
+  end
+
+  local function unhook_onkey()
+    if tonumber(ns_id) and vim.on_key then
+      ---@diagnostic disable-next-line: param-type-mismatch
+      vim.on_key(nil, ns_id)
+    end
   end
 
   local co = coroutine.running()
@@ -259,7 +276,7 @@ function M.raw_fzf(contents, fzf_cli_args, opts)
   -- temporarily set to `false`, for more info see `:help shellslash` (#1055)
   local nvim_opt_shellslash = utils.__WIN_HAS_SHELLSLASH and vim.o.shellslash
   if nvim_opt_shellslash then vim.o.shellslash = false end
-  jobstart(shell_cmd, {
+  chan_id = jobstart(shell_cmd, {
     cwd = cwd,
     pty = true,
     env = {
@@ -268,6 +285,9 @@ function M.raw_fzf(contents, fzf_cli_args, opts)
       ["SKIM_DEFAULT_COMMAND"] = FZF_DEFAULT_COMMAND,
     },
     on_exit = function(_, rc, _)
+      -- clear hook
+      unhook_onkey()
+      unset_debughook()
       local output = {}
       local f = io.open(outputtmpname)
       if f then
@@ -289,6 +309,14 @@ function M.raw_fzf(contents, fzf_cli_args, opts)
       coroutine.resume(co, output, rc)
     end
   })
+
+  -- job failed or cmd[0] is not executable
+  if tonumber(chan_id) < 1 then
+    unhook_onkey()
+    unset_debughook()
+  else
+    pid = vim.fn.jobpid(chan_id)
+  end
 
   -- fzf-tmux spawns outside neovim, don't set filetype/insert mode
   if not opts.is_fzf_tmux then
